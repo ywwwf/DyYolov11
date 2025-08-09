@@ -170,6 +170,9 @@ class BaseTrainer:
         # HUB
         self.hub_session = None
 
+        # 辅助去冻结哪些参数
+        self.only_backbone = self.args.only_backbone
+
         # Callbacks
         self.callbacks = _callbacks or callbacks.get_default_callbacks()
         if RANK in {-1, 0}:
@@ -266,9 +269,13 @@ class BaseTrainer:
         always_freeze_names = [".dfl"]  # always freeze these layers
         freeze_layer_names = [f"model.{x}." for x in freeze_list] + always_freeze_names
         self.freeze_layer_names = freeze_layer_names
-        for k, v in self.model.named_parameters():
+        for i, (k, v) in enumerate(self.model.named_parameters()):
             # v.register_hook(lambda x: torch.nan_to_num(x))  # NaN to 0 (commented for erratic training results)
             if any(x in k for x in freeze_layer_names):
+                LOGGER.info(f"Freezing layer '{k}'")
+                v.requires_grad = False
+            # 冻结exit分支的参数
+            elif self.only_backbone and i >= 24:
                 LOGGER.info(f"Freezing layer '{k}'")
                 v.requires_grad = False
             elif not v.requires_grad and v.dtype.is_floating_point:  # only floating point Tensor can require gradients
@@ -403,7 +410,8 @@ class BaseTrainer:
                 # Forward
                 with autocast(self.amp):
                     batch = self.preprocess_batch(batch)
-                    loss, self.loss_items = self.model(batch)
+                    # 该方法仅考虑训练backbone
+                    loss, self.loss_items = self.model(batch)[0]
                     self.loss = loss.sum()
                     if RANK != -1:
                         self.loss *= world_size

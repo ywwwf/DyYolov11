@@ -169,7 +169,7 @@ class BaseModel(torch.nn.Module):
         Returns:
             (torch.Tensor): The last output of the model.
         """
-        y, dt, embeddings = [], [], []  # outputs
+        y, dt, embeddings, res = [], [], [], []  # outputs
         embed = frozenset(embed) if embed is not None else {-1}
         max_idx = max(embed)
         for m in self.model:
@@ -185,7 +185,22 @@ class BaseModel(torch.nn.Module):
                 embeddings.append(torch.nn.functional.adaptive_avg_pool2d(x, (1, 1)).squeeze(-1).squeeze(-1))  # flatten
                 if m.i == max_idx:
                     return torch.unbind(torch.cat(embeddings, 1), dim=0)
-        return x
+            # 如果是单一训练模式，仅返回第1个head的输出
+            if m.i == 23:
+                res.append(x)
+                if self.only_backbone:
+                    break
+
+        # 如果是联合训练模式，也要返回第2个head的输出
+        if not self.only_backbone:
+            res.append(x)
+
+        # TODO 解决Router返回得分的机制
+        # if self.dynamic:
+        #     score = self.router([y[i] for i in self.router_ins])
+        #     return res, score
+
+        return res
 
     def _predict_augment(self, x):
         """Perform augmentations on input image x and return augmented inference."""
@@ -331,13 +346,20 @@ class BaseModel(torch.nn.Module):
             batch (dict): Batch to compute loss on.
             preds (torch.Tensor | List[torch.Tensor], optional): Predictions.
         """
-        if getattr(self, "criterion", None) is None:
-            self.criterion = self.init_criterion()
+        batch_size = len(batch["im_file"])
+        if getattr(self, "criterion1", None) is None:
+            self.criterion1 = self.init_criterion(True)
+        if getattr(self, "criterion2", None) is None:
+            self.criterion2 = self.init_criterion(False)
 
         preds = self.forward(batch["img"]) if preds is None else preds
-        return self.criterion(preds, batch)
+        raw_losses = [self.criterion1(preds[0], batch)]
+        if len(preds) == 2:
+            raw_losses.append(self.criterion2(preds[1], batch))
 
-    def init_criterion(self):
+        return raw_losses
+
+    def init_criterion(self, only_backbone=True):
         """Initialize the loss criterion for the BaseModel."""
         raise NotImplementedError("compute_loss() needs to be implemented by task heads")
 
@@ -400,26 +422,32 @@ class DetectionModel(BaseModel):
         self.inplace = self.yaml.get("inplace", True)
         self.end2end = getattr(self.model[-1], "end2end", False)
 
-        # Build strides
-        m = self.model[-1]  # Detect()
-        if isinstance(m, Detect):  # includes all Detect subclasses like Segment, Pose, OBB, YOLOEDetect, YOLOESegment
+        # 检查当前的训练模式
+        self.only_backbone = self.yaml["only_backbone"]
+
+        # TODO 添加Router
+
+        # Build strides 为两个Detect模块都需要build strides
+        m1 = self.model[23]  # Detect()
+        if isinstance(m1, Detect):  # includes all Detect subclasses like Segment, Pose, OBB, YOLOEDetect, YOLOESegment
             s = 256  # 2x min stride
-            m.inplace = self.inplace
+            m1.inplace = self.inplace
 
             def _forward(x):
                 """Perform a forward pass through the model, handling different Detect subclass types accordingly."""
                 if self.end2end:
                     return self.forward(x)["one2many"]
-                return self.forward(x)[0] if isinstance(m, (Segment, YOLOESegment, Pose, OBB)) else self.forward(x)
+                return self.forward(x)[0] if isinstance(m1, (Segment, YOLOESegment, Pose, OBB)) else self.forward(x)
 
             self.model.eval()  # Avoid changing batch statistics until training begins
-            m.training = True  # Setting it to True to properly return strides
-            m.stride = torch.tensor([s / x.shape[-2] for x in _forward(torch.zeros(1, ch, s, s))])  # forward
-            self.stride = m.stride
+            m1.training = True  # Setting it to True to properly return strides
+            m1.stride = torch.tensor([s / x.shape[-2] for x in _forward(torch.zeros(1, ch, s, s))[0]])  # forward
+            self.stride = m1.stride
             self.model.train()  # Set model back to training(default) mode
-            m.bias_init()  # only run once
+            m1.bias_init()  # only run once
         else:
             self.stride = torch.Tensor([32])  # default stride for i.e. RTDETR
+        # TODO 为第二个detect模块build stides
 
         # Init weights, biases
         initialize_weights(self)
@@ -494,9 +522,9 @@ class DetectionModel(BaseModel):
         y[-1] = y[-1][..., i:]  # small
         return y
 
-    def init_criterion(self):
+    def init_criterion(self, only_backbone=True):
         """Initialize the loss criterion for the DetectionModel."""
-        return E2EDetectLoss(self) if getattr(self, "end2end", False) else v8DetectionLoss(self)
+        return E2EDetectLoss(self) if getattr(self, "end2end", False) else v8DetectionLoss(self, only_backbone=only_backbone)
 
 
 class OBBModel(DetectionModel):
@@ -1605,7 +1633,14 @@ def parse_model(d, ch, verbose=True):
     if verbose:
         LOGGER.info(f"\n{'':>3}{'from':>20}{'n':>3}{'params':>10}  {'module':<45}{'arguments':<30}")
     ch = [ch]
-    layers, save, c2 = [], [], ch[-1]  # layers, savelist, ch out
+    # 暂时写死save
+    layers, save, c2 = [], [4, 6, 10, 13, 16, 19, 22, 26, 29], ch[-1]  # layers, savelist, ch out
+    # 输出当前设定的训练模式
+    if d["only_backbone"]:
+        save.append(23)
+        LOGGER.info("当前训练模式为：联合训练。")
+    else:
+        LOGGER.info("当前训练模式为：仅训练backbone。")
     base_modules = frozenset(
         {
             Classify,
@@ -1663,7 +1698,8 @@ def parse_model(d, ch, verbose=True):
             A2C2f,
         }
     )
-    for i, (f, n, m, args) in enumerate(d["backbone"] + d["head"]):  # from, number, module, args
+    # 添加了新的模块要解析
+    for i, (f, n, m, args) in enumerate(d["backbone"] + d["head"] + d["b_head"]):  # from, number, module, args
         m = (
             getattr(torch.nn, m[3:])
             if "nn." in m
@@ -1741,7 +1777,7 @@ def parse_model(d, ch, verbose=True):
         m_.i, m_.f, m_.type = i, f, t  # attach index, 'from' index, type
         if verbose:
             LOGGER.info(f"{i:>3}{str(f):>20}{n_:>3}{m_.np:10.0f}  {t:<45}{str(args):<30}")  # print
-        save.extend(x % i for x in ([f] if isinstance(f, int) else f) if x != -1)  # append to savelist
+        # save.extend(x % i for x in ([f] if isinstance(f, int) else f) if x != -1)  # append to savelist
         layers.append(m_)
         if i == 0:
             ch = []

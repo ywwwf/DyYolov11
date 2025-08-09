@@ -210,11 +210,12 @@ class BaseValidator:
             # Loss
             with dt[2]:
                 if self.training:
-                    self.loss += model.loss(batch, preds)[1]
+                    self.loss += model.loss(batch, preds)[0][1]
 
             # Postprocess
             with dt[3]:
-                preds = self.postprocess(preds)
+                # only_backbone = True
+                preds = self.postprocess(preds[0])
 
             self.update_metrics(preds, batch)
             if self.args.plots and batch_i < 3:

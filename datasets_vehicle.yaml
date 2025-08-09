@@ -1,0 +1,6 @@
+train: E:\datasets\88675-main\88675-main\data\data\datasets_vehicle\images\train
+val: E:\datasets\88675-main\88675-main\data\data\datasets_vehicle\images\val
+
+nc: 3
+
+names: ['car', 'bus', 'truck']
