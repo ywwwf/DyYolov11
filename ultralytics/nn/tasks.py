@@ -447,7 +447,26 @@ class DetectionModel(BaseModel):
             m1.bias_init()  # only run once
         else:
             self.stride = torch.Tensor([32])  # default stride for i.e. RTDETR
-        # TODO 为第二个detect模块build stides
+        # 为第二个detect模块build stides
+        if not self.only_backbone:
+            m2 = self.model[-1]
+            if isinstance(m2, Detect):
+                s = 256  # 2x min stride
+                m2.inplace = self.inplace
+
+                def _forward(x):
+                    if self.end2end:
+                        return self.forward(x)["one2many"]
+                    return self.forward(x)[0] if isinstance(m2, (Segment, YOLOESegment, Pose, OBB)) else self.forward(x)
+
+                self.model.eval()
+                m2.training = True
+                m2.stride = torch.tensor([s / x.shape[-2] for x in _forward(torch.zeros(1, ch, s, s))[1]])
+                self.stride = m2.stride
+                self.model.train()
+                m2.bias_init()
+            else:
+                self.stride = torch.Tensor([32])  # default stride for i.e. RTDETR
 
         # Init weights, biases
         initialize_weights(self)
@@ -1638,9 +1657,9 @@ def parse_model(d, ch, verbose=True):
     # 输出当前设定的训练模式
     if d["only_backbone"]:
         save.append(23)
-        LOGGER.info("当前训练模式为：联合训练。")
-    else:
         LOGGER.info("当前训练模式为：仅训练backbone。")
+    else:
+        LOGGER.info("当前训练模式为：联合训练。")
     base_modules = frozenset(
         {
             Classify,

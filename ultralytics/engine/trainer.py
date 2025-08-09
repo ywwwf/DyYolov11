@@ -269,16 +269,30 @@ class BaseTrainer:
         always_freeze_names = [".dfl"]  # always freeze these layers
         freeze_layer_names = [f"model.{x}." for x in freeze_list] + always_freeze_names
         self.freeze_layer_names = freeze_layer_names
-        for i, (k, v) in enumerate(self.model.named_parameters()):
-            # v.register_hook(lambda x: torch.nan_to_num(x))  # NaN to 0 (commented for erratic training results)
+        # 先收集第23层及以后的所有模块
+        frozen_modules = []
+        for idx, module in enumerate(self.model.children()):  # 遍历直接子模块
+            if idx >= 23:
+                frozen_modules.append(module)
+
+        # 再遍历参数，结合两种冻结条件
+        for k, v in self.model.named_parameters():
+            # 条件1：保留原有按名称冻结的逻辑
             if any(x in k for x in freeze_layer_names):
-                LOGGER.info(f"Freezing layer '{k}'")
+                LOGGER.info(f"Freezing layer (by name) '{k}'")
                 v.requires_grad = False
-            # 冻结exit分支的参数
-            elif self.only_backbone and i >= 24:
-                LOGGER.info(f"Freezing layer '{k}'")
-                v.requires_grad = False
-            elif not v.requires_grad and v.dtype.is_floating_point:  # only floating point Tensor can require gradients
+            # 条件2：按 '.' 分割字符串，提取层级数字（适合固定格式）
+            elif self.only_backbone:
+                # 按 '.' 分割参数名
+                parts = k.split('.')
+                # 检查分割后的结构是否符合预期（如 ['model', '23', 'dfl', 'conv', 'weight']）
+                if len(parts) >= 2 and parts[0] == 'model' and parts[1].isdigit():
+                    layer_num = int(parts[1])  # 提取第2部分（索引1）作为层级数字
+                    if layer_num >= 24:
+                        LOGGER.info(f"Freezing layer (by index {layer_num}) '{k}'")
+                        v.requires_grad = False
+            # 其他情况：解冻浮点类型参数
+            elif not v.requires_grad and v.dtype.is_floating_point:
                 LOGGER.warning(
                     f"setting 'requires_grad=True' for frozen layer '{k}'. "
                     "See ultralytics.engine.trainer for customization of frozen layers."
@@ -666,6 +680,7 @@ class BaseTrainer:
             fitness (float): Fitness score for the validation.
         """
         metrics = self.validator(self)
+        print("这一epoch的metrics：{}".format(metrics))
         fitness = metrics.pop("fitness", -self.loss.detach().cpu().numpy())  # use loss as fitness measure if not found
         if not self.best_fitness or self.best_fitness < fitness:
             self.best_fitness = fitness
