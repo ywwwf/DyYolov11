@@ -123,6 +123,7 @@ class BaseTrainer:
         self.args.device = os.getenv("CUDA_VISIBLE_DEVICES") if "cuda" in str(self.device) else str(self.device)
         self.validator = None
         self.metrics = None
+        self.metrics_exit = None
         self.plots = {}
         init_seeds(self.args.seed + 1 + RANK, deterministic=self.args.deterministic)
 
@@ -161,8 +162,11 @@ class BaseTrainer:
         # Epoch level metrics
         self.best_fitness = None
         self.fitness = None
+        self.fitness_exit = None
         self.loss = None
+        self.ex_loss = None
         self.tloss = None
+        self.ex_tloss = None
         self.loss_names = ["Loss"]
         self.csv = self.save_dir / "results.csv"
         self.plot_idx = [0, 1, 2]
@@ -269,29 +273,20 @@ class BaseTrainer:
         always_freeze_names = [".dfl"]  # always freeze these layers
         freeze_layer_names = [f"model.{x}." for x in freeze_list] + always_freeze_names
         self.freeze_layer_names = freeze_layer_names
-        # 先收集第23层及以后的所有模块
-        frozen_modules = []
-        for idx, module in enumerate(self.model.children()):  # 遍历直接子模块
-            if idx >= 23:
-                frozen_modules.append(module)
 
-        # 再遍历参数，结合两种冻结条件
         for k, v in self.model.named_parameters():
-            # 条件1：保留原有按名称冻结的逻辑
             if any(x in k for x in freeze_layer_names):
                 LOGGER.info(f"Freezing layer (by name) '{k}'")
                 v.requires_grad = False
-            # 条件2：按 '.' 分割字符串，提取层级数字（适合固定格式）
+            # 仅训练backbone的时候，冻结exit分支
             elif self.only_backbone:
                 # 按 '.' 分割参数名
                 parts = k.split('.')
-                # 检查分割后的结构是否符合预期（如 ['model', '23', 'dfl', 'conv', 'weight']）
                 if len(parts) >= 2 and parts[0] == 'model' and parts[1].isdigit():
                     layer_num = int(parts[1])  # 提取第2部分（索引1）作为层级数字
                     if layer_num >= 24:
                         LOGGER.info(f"Freezing layer (by index {layer_num}) '{k}'")
                         v.requires_grad = False
-            # 其他情况：解冻浮点类型参数
             elif not v.requires_grad and v.dtype.is_floating_point:
                 LOGGER.warning(
                     f"setting 'requires_grad=True' for frozen layer '{k}'. "
@@ -339,6 +334,7 @@ class BaseTrainer:
             self.validator = self.get_validator()
             metric_keys = self.validator.metrics.keys + self.label_loss_items(prefix="val")
             self.metrics = dict(zip(metric_keys, [0] * len(metric_keys)))
+            self.metrics_exit = dict(zip(metric_keys, [0] * len(metric_keys)))
             self.ema = ModelEMA(self.model)
             if self.args.plots:
                 self.plot_training_labels()
@@ -403,7 +399,10 @@ class BaseTrainer:
                 self.train_loader.reset()
 
             if RANK in {-1, 0}:
-                LOGGER.info(self.progress_string())
+                if self.only_backbone:
+                    LOGGER.info(self.progress_string())
+                else:
+                    LOGGER.info(self.ex_progress_string())
                 pbar = TQDM(enumerate(self.train_loader), total=nb)
             self.tloss = None
             for i, batch in pbar:
@@ -424,17 +423,28 @@ class BaseTrainer:
                 # Forward
                 with autocast(self.amp):
                     batch = self.preprocess_batch(batch)
-                    # 该方法仅考虑训练backbone
-                    loss, self.loss_items = self.model(batch)[0]
+                    raw_losses = self.model(batch)
+                    loss, self.loss_items = raw_losses[0]
                     self.loss = loss.sum()
                     if RANK != -1:
                         self.loss *= world_size
                     self.tloss = (
                         (self.tloss * i + self.loss_items) / (i + 1) if self.tloss is not None else self.loss_items
                     )
+                    # 分支的loss
+                    if not self.only_backbone:
+                        ex_loss, self.ex_loss_items = raw_losses[1]
+                        self.ex_loss = ex_loss.sum()
+                        self.ex_tloss = (
+                            (self.ex_tloss * i + self.ex_loss_items) / (i + 1) if self.ex_tloss is not None else self.ex_loss_items
+                        )
 
                 # Backward
-                self.scaler.scale(self.loss).backward()
+                if self.only_backbone:
+                    self.scaler.scale(self.loss).backward()
+                else:
+                    self.scaler.scale(self.loss).backward(retain_graph=True)
+                    self.scaler.scale(self.ex_loss).backward()
 
                 # Optimize - https://pytorch.org/docs/master/notes/amp_examples.html
                 if ni - last_opt_step >= self.accumulate:
@@ -452,23 +462,44 @@ class BaseTrainer:
                             break
 
                 # Log
-                if RANK in {-1, 0}:
-                    loss_length = self.tloss.shape[0] if len(self.tloss.shape) else 1
-                    pbar.set_description(
-                        ("%11s" * 2 + "%11.4g" * (2 + loss_length))
-                        % (
-                            f"{epoch + 1}/{self.epochs}",
-                            f"{self._get_memory():.3g}G",  # (GB) GPU memory util
-                            *(self.tloss if loss_length > 1 else torch.unsqueeze(self.tloss, 0)),  # losses
-                            batch["cls"].shape[0],  # batch size, i.e. 8
-                            batch["img"].shape[-1],  # imgsz, i.e 640
+                if self.only_backbone:
+                    if RANK in {-1, 0}:
+                        loss_length = self.tloss.shape[0] if len(self.tloss.shape) else 1
+                        pbar.set_description(
+                            ("%11s" * 2 + "%11.4g" * (2 + loss_length))
+                            % (
+                                f"{epoch + 1}/{self.epochs}",
+                                f"{self._get_memory():.3g}G",  # (GB) GPU memory util
+                                *(self.tloss if loss_length > 1 else torch.unsqueeze(self.tloss, 0)),  # losses
+                                batch["cls"].shape[0],  # batch size, i.e. 8
+                                batch["img"].shape[-1],  # imgsz, i.e 640
+                            )
                         )
-                    )
-                    self.run_callbacks("on_batch_end")
-                    if self.args.plots and ni in self.plot_idx:
-                        self.plot_training_samples(batch, ni)
+                        self.run_callbacks("on_batch_end")
+                        if self.args.plots and ni in self.plot_idx:
+                            self.plot_training_samples(batch, ni)
+                else:
+                    if RANK in {-1, 0}:
+                        loss_length = self.tloss.shape[0] if len(self.tloss.shape) else 1
+                        ex_loss_length = self.ex_tloss.shape[0] if len(self.ex_tloss.shape) else 1
+                        pbar.set_description(
+                            ("%11s" * 2 + "%11.4g" * (2 + loss_length + ex_loss_length))
+                            % (
+                                f"{epoch + 1}/{self.epochs}",
+                                f"{self._get_memory():.3g}G",  # (GB) GPU memory util
+                                *(self.tloss if loss_length > 1 else torch.unsqueeze(self.tloss, 0)),  # losses
+                                *(self.ex_tloss if ex_loss_length > 1 else torch.unsqueeze(self.ex_tloss, 0)),
+                                batch["cls"].shape[0],  # batch size, i.e. 8
+                                batch["img"].shape[-1],  # imgsz, i.e 640
+                            )
+                        )
+                        self.run_callbacks("on_batch_end")
+                        if self.args.plots and ni in self.plot_idx:
+                            self.plot_training_samples(batch, ni)
 
                 self.run_callbacks("on_train_batch_end")
+
+            # end of batch
 
             self.lr = {f"lr/pg{ir}": x["lr"] for ir, x in enumerate(self.optimizer.param_groups)}  # for loggers
             self.run_callbacks("on_train_epoch_end")
@@ -479,8 +510,27 @@ class BaseTrainer:
                 # Validation
                 if self.args.val or final_epoch or self.stopper.possible_stop or self.stop:
                     self._clear_memory(threshold=0.5)  # prevent VRAM spike
-                    self.metrics, self.fitness = self.validate()
-                self.save_metrics(metrics={**self.label_loss_items(self.tloss), **self.metrics, **self.lr})
+                    self.metrics, self.fitness = self.validate(True)
+                # Branchy Validation 验证分支的结果
+                if self.args.val and not self.only_backbone:
+                    self._clear_memory(threshold=0.5)
+                    self.metrics_exit, self.fitness_exit = self.validate(False)
+                    # 修改 self.metrics_exit 的键的名称 为所有键名添加"EX"前缀 方便之后记录
+                    self.metrics_exit = {f"EX{key}": value for key, value in self.metrics_exit.items()}
+                    # TODO 把self.metrics_exit拼接到self.metrics当中？
+                # 给两个出口的综合得分标准赋予不同权重，倾向于选择分支效果更好的模型
+                # TODO 将超参提取出来 self.metrics保存模型呢块不改了
+                self.fitness = 0.3 * self.fitness + 0.7 * self.fitness_exit
+                # 由于需要计算两个fitness 所以best_fitness的标准也要发生变化
+                if not self.best_fitness or self.best_fitness < self.fitness:
+                    self.best_fitness = self.fitness
+
+                self.save_metrics(metrics={
+                    **self.label_loss_items(self.tloss),
+                    **self.metrics,
+                    **self.metrics_exit,
+                    **self.lr})
+
                 self.stop |= self.stopper(epoch + 1, self.fitness) or final_epoch
                 if self.args.time:
                     self.stop |= (time.time() - self.train_time_start) > (self.args.time * 3600)
@@ -511,6 +561,7 @@ class BaseTrainer:
             if self.stop:
                 break  # must break all DDP ranks
             epoch += 1
+        # end of epoch
 
         if RANK in {-1, 0}:
             # Do final val with best.pt
@@ -671,19 +722,19 @@ class BaseTrainer:
         """Allow custom preprocessing model inputs and ground truths depending on task type."""
         return batch
 
-    def validate(self):
+    def validate(self, only_backbone=True):
         """
         Run validation on test set using self.validator.
+
+        Args:
+            only_backbone (bool): 作为区别验证模式的标志，验证main分支还是exit分支.
 
         Returns:
             metrics (dict): Dictionary of validation metrics.
             fitness (float): Fitness score for the validation.
         """
-        metrics = self.validator(self)
-        print("这一epoch的metrics：{}".format(metrics))
+        metrics = self.validator(self, only_backbone)
         fitness = metrics.pop("fitness", -self.loss.detach().cpu().numpy())  # use loss as fitness measure if not found
-        if not self.best_fitness or self.best_fitness < fitness:
-            self.best_fitness = fitness
         return metrics, fitness
 
     def get_model(self, cfg=None, weights=None, verbose=True):
@@ -723,6 +774,22 @@ class BaseTrainer:
         """Return a string describing training progress."""
         return ""
 
+    def ex_progress_string(self):
+        """联合训练时的日志需要查看exit分支的训练情况."""
+        loss_len = 3
+        return ("\n" + "%11s" * (4 + loss_len * 2)) % (
+            "Epoch",
+            "GPU_mem",
+            "box_loss",
+            "cls_loss",
+            "dfl_loss",
+            "ex_box_loss",
+            "ex_cls_loss",
+            "ex_dfl_loss",
+            "Instances",
+            "Size",
+        )
+
     # TODO: may need to put these following functions into callback
     def plot_training_samples(self, batch, ni):
         """Plot training samples during YOLO training."""
@@ -734,6 +801,7 @@ class BaseTrainer:
 
     def save_metrics(self, metrics):
         """Save training metrics to a CSV file."""
+        # TODO 添加训练exit分支的记录
         keys, vals = list(metrics.keys()), list(metrics.values())
         n = len(metrics) + 2  # number of cols
         s = "" if self.csv.exists() else (("%s," * n % tuple(["epoch", "time"] + keys)).rstrip(",") + "\n")  # header

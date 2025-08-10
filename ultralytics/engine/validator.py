@@ -127,13 +127,14 @@ class BaseValidator:
         self.callbacks = _callbacks or callbacks.get_default_callbacks()
 
     @smart_inference_mode()
-    def __call__(self, trainer=None, model=None):
+    def __call__(self, trainer=None, model=None, only_backbone=True):
         """
         Execute validation process, running inference on dataloader and computing performance metrics.
 
         Args:
             trainer (object, optional): Trainer object that contains the model to validate.
             model (nn.Module, optional): Model to validate if not using a trainer.
+            only_backbone (bool): 作为区别验证模式的标志，验证main分支还是exit分支.
 
         Returns:
             (dict): Dictionary containing validation statistics.
@@ -210,12 +211,17 @@ class BaseValidator:
             # Loss
             with dt[2]:
                 if self.training:
-                    self.loss += model.loss(batch, preds)[0][1]
+                    if only_backbone:
+                        self.loss += model.loss(batch, preds)[0][1]
+                    else:
+                        self.loss += model.loss(batch, preds)[1][1]
 
             # Postprocess
             with dt[3]:
-                # only_backbone = True
-                preds = self.postprocess(preds[0])
+                if only_backbone:
+                    preds = self.postprocess(preds[0])
+                else:
+                    preds = self.postprocess(preds[1])
 
             self.update_metrics(preds, batch)
             if self.args.plots and batch_i < 3:

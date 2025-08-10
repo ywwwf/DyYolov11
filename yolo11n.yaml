@@ -62,7 +62,7 @@ b_head:
 
   - [[26, 29], 1, Detect, [nc]] # Detect(P3, P4)
 
-only_backbone: True
+only_backbone: False
 
 dynamic: False
 

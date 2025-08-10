@@ -353,6 +353,7 @@ class BaseModel(torch.nn.Module):
             self.criterion2 = self.init_criterion(False)
 
         preds = self.forward(batch["img"]) if preds is None else preds
+        # 注意验证的时候preds是有内容的
         raw_losses = [self.criterion1(preds[0], batch)]
         if len(preds) == 2:
             raw_losses.append(self.criterion2(preds[1], batch))
@@ -1657,9 +1658,9 @@ def parse_model(d, ch, verbose=True):
     # 输出当前设定的训练模式
     if d["only_backbone"]:
         save.append(23)
-        LOGGER.info("当前训练模式为：仅训练backbone。")
+        print("当前训练模式为：only training backbone。")
     else:
-        LOGGER.info("当前训练模式为：联合训练。")
+        print("当前训练模式为：joint training。")
     base_modules = frozenset(
         {
             Classify,
