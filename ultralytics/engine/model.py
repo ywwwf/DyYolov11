@@ -6,7 +6,9 @@ from typing import Any, Dict, List, Union
 
 import numpy as np
 import torch
+import torch.nn as nn
 from PIL import Image
+from tqdm import tqdm
 
 from ultralytics.cfg import TASK2DATA, get_cfg, get_save_dir
 from ultralytics.engine.results import Results
@@ -805,6 +807,32 @@ class Model(torch.nn.Module):
             self.overrides = self.model.args
             self.metrics = getattr(self.trainer.validator, "metrics", None)  # TODO: no metrics returned by DDP
         return self.metrics
+
+    def get_thres(self, pretrained, trainer=None, **kwargs: Any):
+        self.load(pretrained)
+        print("加载了预训练模型，来源于：{}".format(pretrained))
+
+        overrides = YAML.load(checks.check_yaml(kwargs["cfg"])) if kwargs.get("cfg") else self.overrides
+        custom = {
+            # NOTE: handle the case when 'cfg' includes 'data'.
+            "data": overrides.get("data") or DEFAULT_CFG_DICT["data"] or TASK2DATA[self.task],
+            "model": self.overrides["model"],
+            "task": self.task,
+        }  # method defaults
+        args = {**overrides, **custom, **kwargs, "mode": "train"}  # highest priority args on the right
+
+        self.trainer = (trainer or self._smart_load("trainer"))(overrides=args, _callbacks=self.callbacks)
+        if not args.get("resume"):  # manually set model only if not resuming
+            self.trainer.model = self.trainer.get_model(weights=self.model if self.ckpt else None, cfg=self.model.yaml)
+            self.model = self.trainer.model
+
+        thres = self.trainer._get_thres()
+        print()
+        print('***************************************************')
+        print(' '.join(thres))
+        for idx, thr in enumerate(thres):
+            print('First: {}%\tSecond: {}%\tThreshold: {}'.format(100 - idx * 10, idx * 10, thr))
+        print('***************************************************')
 
     def tune(
         self,

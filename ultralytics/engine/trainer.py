@@ -20,6 +20,7 @@ import numpy as np
 import torch
 from torch import distributed as dist
 from torch import nn, optim
+from tqdm import tqdm
 
 from ultralytics import __version__
 from ultralytics.cfg import get_cfg, get_save_dir
@@ -441,7 +442,7 @@ class BaseTrainer:
                     pg1.append(v.weight)  # apply decay
 
         self.optimizer = optim.AdamW(pg1, lr=hyp['lr0'], weight_decay=hyp['weight_decay'],
-                                    betas=(hyp['momentum'], 0.999))  # adjust beta1 to momentum
+                                     betas=(hyp['momentum'], 0.999))  # adjust beta1 to momentum
 
         if len(pg0):
             self.optimizer.add_param_group({'params': pg0, 'weight_decay': 0})  # add pg0 without weight_decay
@@ -535,7 +536,8 @@ class BaseTrainer:
                         ex_loss, self.ex_loss_items = raw_losses[1]
                         self.ex_loss = ex_loss.sum()
                         self.ex_tloss = (
-                            (self.ex_tloss * i + self.ex_loss_items) / (i + 1) if self.ex_tloss is not None else self.ex_loss_items
+                            (self.ex_tloss * i + self.ex_loss_items) / (
+                                        i + 1) if self.ex_tloss is not None else self.ex_loss_items
                         )
 
                 # Backward
@@ -717,7 +719,8 @@ class BaseTrainer:
                 self.train_loader.reset()
 
             if RANK in {-1, 0}:
-                LOGGER.info(('\n' + '%10s' * 8) % ('Epoch', 'gpu_mem', 'diff', 'score.0', 'score.1', 'total', 'labels', 'img_size'))
+                LOGGER.info(('\n' + '%10s' * 8) % (
+                'Epoch', 'gpu_mem', 'diff', 'score.0', 'score.1', 'total', 'labels', 'img_size'))
                 pbar = TQDM(enumerate(self.train_loader), total=nb)
             self.tloss = None
             for i, batch in pbar:
@@ -835,6 +838,64 @@ class BaseTrainer:
         unset_deterministic()
         self.run_callbacks("teardown")
 
+    def _get_thres(self, batch_size=32, imgsz=640, augment=False, half_precision=True):
+        device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+        self.model.to(device)
+        # Dataloader
+        with torch_distributed_zero_first(LOCAL_RANK):  # avoid auto-downloading dataset multiple times
+            self.data = self.get_dataset()
+        self.val_loader = self.get_dataloader(
+            self.data["val"], batch_size=batch_size, rank=LOCAL_RANK, mode="val"
+        )
+
+        for p in self.model.parameters():
+            p.requires_grad = False
+        self.model.float().fuse().eval()
+
+        # Compatibility updates
+        for m in self.model.modules():
+            if type(m) in [nn.Hardswish, nn.LeakyReLU, nn.ReLU, nn.ReLU6, nn.SiLU]:
+                m.inplace = True  # pytorch 1.7.0 compatibility
+            elif type(m) is nn.Upsample:
+                m.recompute_scale_factor = None  # torch 1.11.0 compatibility
+
+        # Check imgsz
+        gs = max(int(self.model.stride.max() if hasattr(self.model, "stride") else 32), 32)  # grid size (max stride)
+        self.args.imgsz = check_imgsz(self.args.imgsz, stride=gs, floor=gs, max_dim=1)
+        self.stride = gs  # for multiscale training
+        # TODO 什么情况下model不止是有模块？
+        self.model.get_score = True
+
+        # Half
+        half = device.type != 'cpu' and half_precision  # half precision only supported on CUDA
+        if half:
+            self.model.half()
+
+        # TODO 为什么此处半精度有问题？
+        self.model.float()
+        if device.type != 'cpu':
+            self.model(torch.zeros(1, 3, imgsz, imgsz).to(device).type_as(next(self.model.parameters())))  # run once
+
+        print(self.val_loader)
+        score_list = []
+        for batch_i, img_batch in enumerate(tqdm(self.val_loader)):
+            img = img_batch["img"]
+            img = img.to(device, non_blocking=True)
+            # img = img.half() if half else img.float()  # uint8 to fp16/32
+            img = img.float()
+            img /= 255.0  # 0 - 255 to 0.0 - 1.0
+            with torch.no_grad():
+                # Run model
+                cur_score = self.model(img, augment=augment)  # inference
+                for item in cur_score:
+                    score_list.append(item.item())
+
+        thres = ['0']
+        for i in list(range(10, 100, 10)):
+            thres.append(str(np.percentile(score_list, i)))
+        thres.append('1')
+        return thres
+
     def auto_batch(self, max_num_obj=0):
         """Calculate optimal batch size based on model and device memory constraints."""
         return check_train_batch_size(
@@ -856,7 +917,7 @@ class BaseTrainer:
             memory = torch.cuda.memory_reserved()
             if fraction:
                 total = torch.cuda.get_device_properties(self.device).total_memory
-        return ((memory / total) if total > 0 else 0) if fraction else (memory / 2**30)
+        return ((memory / total) if total > 0 else 0) if fraction else (memory / 2 ** 30)
 
     def _clear_memory(self, threshold: float = None):
         """Clear accelerator memory by calling garbage collector and emptying cache."""
@@ -997,7 +1058,8 @@ class BaseTrainer:
         """
         metrics = self.validator(self, only_backbone=only_backbone, dynamic=dynamic)
         if not dynamic:
-            fitness = metrics.pop("fitness", -self.loss.detach().cpu().numpy())  # use loss as fitness measure if not found
+            fitness = metrics.pop("fitness",
+                                  -self.loss.detach().cpu().numpy())  # use loss as fitness measure if not found
         else:
             fitness = metrics.pop("val/adaptive_loss")
         return metrics, fitness
@@ -1131,10 +1193,10 @@ class BaseTrainer:
                 self.args = get_cfg(ckpt_args)
                 self.args.model = self.args.resume = str(last)  # reinstate model
                 for k in (
-                    "imgsz",
-                    "batch",
-                    "device",
-                    "close_mosaic",
+                        "imgsz",
+                        "batch",
+                        "device",
+                        "close_mosaic",
                 ):  # allow arg updates to reduce memory or update device on resume
                     if k in overrides:
                         setattr(self.args, k, overrides[k])
