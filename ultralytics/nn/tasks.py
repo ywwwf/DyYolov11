@@ -7,6 +7,7 @@ import types
 from copy import deepcopy
 from pathlib import Path
 
+import numpy as np
 import torch
 import torch.nn as nn
 
@@ -69,6 +70,7 @@ from ultralytics.nn.modules import (
     YOLOESegment,
     v10Detect,
 )
+from ultralytics.nn.modules.Router import AdaptiveRouter
 from ultralytics.utils import DEFAULT_CFG_DICT, DEFAULT_CFG_KEYS, LOGGER, YAML, colorstr, emojis
 from ultralytics.utils.checks import check_requirements, check_suffix, check_yaml
 from ultralytics.utils.loss import (
@@ -172,35 +174,136 @@ class BaseModel(torch.nn.Module):
         y, dt, embeddings, res = [], [], [], []  # outputs
         embed = frozenset(embed) if embed is not None else {-1}
         max_idx = max(embed)
-        for m in self.model:
-            if m.f != -1:  # if not from previous layer
-                x = y[m.f] if isinstance(m.f, int) else [x if j == -1 else y[j] for j in m.f]  # from earlier layers
-            if profile:
-                self._profile_one_layer(m, x, dt)
-            x = m(x)  # run
-            y.append(x if m.i in self.save else None)  # save output
-            if visualize:
-                feature_visualization(x, m.type, m.i, save_dir=visualize)
-            if m.i in embed:
-                embeddings.append(torch.nn.functional.adaptive_avg_pool2d(x, (1, 1)).squeeze(-1).squeeze(-1))  # flatten
-                if m.i == max_idx:
-                    return torch.unbind(torch.cat(embeddings, 1), dim=0)
-            # 如果是单一训练模式，仅返回第1个head的输出
-            if m.i == 23:
+        # 联合训练
+        if not self.dynamic:
+            for m in self.model:
+                if m.f != -1:  # if not from previous layer
+                    x = y[m.f] if isinstance(m.f, int) else [x if j == -1 else y[j] for j in m.f]  # from earlier layers
+                if profile:
+                    self._profile_one_layer(m, x, dt)
+                x = m(x)  # run
+                y.append(x if m.i in self.save else None)  # save output
+                if visualize:
+                    feature_visualization(x, m.type, m.i, save_dir=visualize)
+                if m.i in embed:
+                    embeddings.append(torch.nn.functional.adaptive_avg_pool2d(x, (1, 1)).squeeze(-1).squeeze(-1))  # flatten
+                    if m.i == max_idx:
+                        return torch.unbind(torch.cat(embeddings, 1), dim=0)
+                # 如果是单一训练模式，仅返回第1个head的输出
+                if m.i == 23:
+                    res.append(x)
+                    if self.only_backbone:
+                        break
+
+            # 如果是联合训练模式，也要返回第2个head的输出
+            if not self.only_backbone:
                 res.append(x)
-                if self.only_backbone:
+
+            return res
+        # Router训练
+        else:
+            # shared backbone
+            for m in self.model:
+                if m.f != -1:  # if not from previous layer
+                    x = y[m.f] if isinstance(m.f, int) else [x if j == -1 else y[j] for j in m.f]  # from earlier layers
+                if profile:
+                    self._profile_one_layer(m, x, dt)
+                x = m(x)  # run
+                y.append(x if m.i in self.save else None)  # save output
+                if visualize:
+                    feature_visualization(x, m.type, m.i, save_dir=visualize)
+                if m.i in embed:
+                    embeddings.append(torch.nn.functional.adaptive_avg_pool2d(x, (1, 1)).squeeze(-1).squeeze(-1))  # flatten
+                    if m.i == max_idx:
+                        return torch.unbind(torch.cat(embeddings, 1), dim=0)
+                # 截止到模块6 都是shared backbone
+                if m.i == 6:
                     break
+            # 根据shared backbone的两个特征图计算difficulty score 注意此处的score = 1 - difficulty score(paper)
+            score = self.router([y[i] for i in self.router_ins])
+            if not hasattr(self, 'get_score'):
+                self.get_score = False
+            if self.get_score:
+                return score
 
-        # 如果是联合训练模式，也要返回第2个head的输出
-        if not self.only_backbone:
-            res.append(x)
+            # 训练模式的时候，需要返回两个出口的结果
+            # TODO 暂时不再用self.training作为标志 专门去设置一个inference mode
+            if not self.fast_inference_mode:
+                for m in self.model:
+                    # 已经有了前6个模块计算的结果
+                    if m.i <= 6:
+                        continue
+                    if m.f != -1:  # if not from previous layer
+                        x = y[m.f] if isinstance(m.f, int) else [x if j == -1 else y[j] for j in
+                                                                 m.f]  # from earlier layers
+                    if profile:
+                        self._profile_one_layer(m, x, dt)
+                    x = m(x)  # run
+                    y.append(x if m.i in self.save else None)  # save output
+                    if visualize:
+                        feature_visualization(x, m.type, m.i, save_dir=visualize)
+                    if m.i in embed:
+                        embeddings.append(
+                            torch.nn.functional.adaptive_avg_pool2d(x, (1, 1)).squeeze(-1).squeeze(-1))  # flatten
+                        if m.i == max_idx:
+                            return torch.unbind(torch.cat(embeddings, 1), dim=0)
+                    if m.i == 23:
+                        res.append(x)
+                res.append(x)
+                return res, score
+            # 推理模式的时候，仅返回受到阈值限制的结果
+            else:
+                # 需要完整的网络
+                if score[:, 0] < self.dy_thres:
+                    for m in self.model:
+                        # 已经有了前6个模块计算的结果
+                        if m.i <= 6:
+                            continue
+                        if m.f != -1:  # if not from previous layer
+                            x = y[m.f] if isinstance(m.f, int) else [x if j == -1 else y[j] for j in
+                                                                     m.f]  # from earlier layers
+                        if profile:
+                            self._profile_one_layer(m, x, dt)
+                        x = m(x)  # run
+                        y.append(x if m.i in self.save else None)  # save output
+                        if visualize:
+                            feature_visualization(x, m.type, m.i, save_dir=visualize)
+                        if m.i in embed:
+                            embeddings.append(
+                                torch.nn.functional.adaptive_avg_pool2d(x, (1, 1)).squeeze(-1).squeeze(-1))  # flatten
+                            if m.i == max_idx:
+                                return torch.unbind(torch.cat(embeddings, 1), dim=0)
+                        if m.i == 23:
+                            break
+                    res.append(x)
+                    return res
+                # 可以早退
+                else:
+                    for m in self.model:
+                        # 已经有了前6个模块计算的结果
+                        if m.i <= 6:
+                            continue
+                        if m.i <= 23:
+                            # 保证存的下标一致
+                            y.append(x if m.i in self.save else None)
+                            continue
+                        if m.f != -1:  # if not from previous layer
+                            x = y[m.f] if isinstance(m.f, int) else [x if j == -1 else y[j] for j in
+                                                                     m.f]  # from earlier layers
+                        if profile:
+                            self._profile_one_layer(m, x, dt)
+                        x = m(x)  # run
+                        y.append(x if m.i in self.save else None)  # save output
+                        if visualize:
+                            feature_visualization(x, m.type, m.i, save_dir=visualize)
+                        if m.i in embed:
+                            embeddings.append(
+                                torch.nn.functional.adaptive_avg_pool2d(x, (1, 1)).squeeze(-1).squeeze(-1))  # flatten
+                            if m.i == max_idx:
+                                return torch.unbind(torch.cat(embeddings, 1), dim=0)
+                    res.append(x)
+                    return res
 
-        # TODO 解决Router返回得分的机制
-        # if self.dynamic:
-        #     score = self.router([y[i] for i in self.router_ins])
-        #     return res, score
-
-        return res
 
     def _predict_augment(self, x):
         """Perform augmentations on input image x and return augmented inference."""
@@ -352,13 +455,34 @@ class BaseModel(torch.nn.Module):
         if getattr(self, "criterion2", None) is None:
             self.criterion2 = self.init_criterion(False)
 
-        preds = self.forward(batch["img"]) if preds is None else preds
-        # 注意验证的时候preds是有内容的
-        raw_losses = [self.criterion1(preds[0], batch)]
-        if len(preds) == 2:
-            raw_losses.append(self.criterion2(preds[1], batch))
+        if not self.dynamic:
+            preds = self.forward(batch["img"]) if preds is None else preds
+            # 注意验证的时候preds是有内容的
+            raw_losses = [self.criterion1(preds[0], batch)]
+            if len(preds) == 2:
+                raw_losses.append(self.criterion2(preds[1], batch))
+            return raw_losses
+        else:
+            preds, score = self.forward(batch["img"])
+            _, loss_items2 = self.criterion1(preds[0], batch)  # 应当用简单网络的loss - 复杂网络的loss
+            _, self.loss_items = self.criterion2(preds[1], batch)
+            loss = self.loss_items.sum()
+            loss_2 = loss_items2.sum()
+            self.iter_count += 1
+            current_diff = loss - loss_2
+            self.diff_list.append(current_diff.item())
+            # (online) calculation of the loss difference
+            if self.iter_count < 10000:
+                self.tracked_diff = np.median(self.diff_list)
+            elif self.iter_count % 1000 == 0:
+                self.tracked_diff = np.median(self.diff_list)
+            loss = loss - self.tracked_diff / 2
+            loss_2 = loss_2 + self.tracked_diff / 2
+            adaptive_loss = score[:, 0] * loss + (1 - score[:, 0]) * loss_2
+            # 标量升维
+            current_diff_1d = current_diff.unsqueeze(0)
+            return adaptive_loss * batch_size, torch.cat((current_diff_1d, score[:, 0], 1 - score[:, 0], adaptive_loss)).detach()
 
-        return raw_losses
 
     def init_criterion(self, only_backbone=True):
         """Initialize the loss criterion for the BaseModel."""
@@ -426,7 +550,23 @@ class DetectionModel(BaseModel):
         # 检查当前的训练模式
         self.only_backbone = self.yaml["only_backbone"]
 
-        # TODO 添加Router
+        # 检查当前是否启用了快速推理模式
+        self.fast_inference_mode = self.yaml["fast_inference_mode"]
+
+        # 添加Router模块
+        self.dynamic = self.yaml["dynamic"]
+        if self.dynamic:
+            router_channels = self.yaml['router_channels']
+            reduction = self.yaml.get('router_reduction', 4)
+            self.router = AdaptiveRouter(router_channels, 1, reduction=reduction)
+            self.router_ins = self.yaml['router_ins']
+            self.dy_thres = 0.5
+            self.get_score = False
+
+        # 用于控制loss补偿的更新频率
+        self.iter_count = 0
+        # 用于取得loss差值的中位数
+        self.diff_list = []
 
         # Build strides 为两个Detect模块都需要build strides
         m1 = self.model[23]  # Detect()
@@ -442,7 +582,10 @@ class DetectionModel(BaseModel):
 
             self.model.eval()  # Avoid changing batch statistics until training begins
             m1.training = True  # Setting it to True to properly return strides
+            temp_dynamic = self.dynamic
+            self.dynamic = False  # 避免返回值多个score
             m1.stride = torch.tensor([s / x.shape[-2] for x in _forward(torch.zeros(1, ch, s, s))[0]])  # forward
+            self.dynamic = temp_dynamic
             self.stride = m1.stride
             self.model.train()  # Set model back to training(default) mode
             m1.bias_init()  # only run once
@@ -462,7 +605,10 @@ class DetectionModel(BaseModel):
 
                 self.model.eval()
                 m2.training = True
+                temp_dynamic = self.dynamic
+                self.dynamic = False  # 避免返回值多个score
                 m2.stride = torch.tensor([s / x.shape[-2] for x in _forward(torch.zeros(1, ch, s, s))[1]])
+                self.dynamic = temp_dynamic
                 self.stride = m2.stride
                 self.model.train()
                 m2.bias_init()
@@ -1656,11 +1802,14 @@ def parse_model(d, ch, verbose=True):
     # 暂时写死save
     layers, save, c2 = [], [4, 6, 10, 13, 16, 19, 22, 26, 29], ch[-1]  # layers, savelist, ch out
     # 输出当前设定的训练模式
-    if d["only_backbone"]:
-        save.append(23)
-        print("当前训练模式为：only training backbone。")
+    if not d["dynamic"]:
+        if d["only_backbone"]:
+            save.append(23)
+            print("当前训练模式为：only training backbone。")
+        else:
+            print("当前训练模式为：joint training。")
     else:
-        print("当前训练模式为：joint training。")
+        print("当前训练模式为：Router training。")
     base_modules = frozenset(
         {
             Classify,

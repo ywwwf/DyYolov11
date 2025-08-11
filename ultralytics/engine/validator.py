@@ -127,7 +127,7 @@ class BaseValidator:
         self.callbacks = _callbacks or callbacks.get_default_callbacks()
 
     @smart_inference_mode()
-    def __call__(self, trainer=None, model=None, only_backbone=True):
+    def __call__(self, trainer=None, model=None, only_backbone=True, dynamic=False):
         """
         Execute validation process, running inference on dataloader and computing performance metrics.
 
@@ -206,29 +206,44 @@ class BaseValidator:
 
             # Inference
             with dt[1]:
-                preds = model(batch["img"], augment=augment)
+                if not dynamic:
+                    preds = model(batch["img"], augment=augment)
 
             # Loss
             with dt[2]:
                 if self.training:
-                    if only_backbone:
-                        self.loss += model.loss(batch, preds)[0][1]
+                    if not dynamic:
+                        if only_backbone:
+                            self.loss += model.loss(batch, preds)[0][1]
+                        else:
+                            self.loss += model.loss(batch, preds)[1][1]
                     else:
-                        self.loss += model.loss(batch, preds)[1][1]
+                        # 直接交由loss作为fitness
+                        self.loss += model(batch)[1]
 
             # Postprocess
             with dt[3]:
-                if only_backbone:
-                    preds = self.postprocess(preds[0])
-                else:
-                    preds = self.postprocess(preds[1])
+                if not dynamic:
+                    if only_backbone:
+                        preds = self.postprocess(preds[0])
+                    else:
+                        preds = self.postprocess(preds[1])
 
-            self.update_metrics(preds, batch)
-            if self.args.plots and batch_i < 3:
-                self.plot_val_samples(batch, batch_i)
-                self.plot_predictions(batch, preds, batch_i)
+            if not dynamic:
+                self.update_metrics(preds, batch)
+                if self.args.plots and batch_i < 3:
+                    self.plot_val_samples(batch, batch_i)
+                    self.plot_predictions(batch, preds, batch_i)
 
-            self.run_callbacks("on_val_batch_end")
+                self.run_callbacks("on_val_batch_end")
+
+        if self.training and dynamic:
+            model.float()
+            # TODO 继承的方法为什么都对应不上？
+            results = {**trainer.label_loss_items_dy(self.loss.cpu() / len(self.dataloader), prefix="val")}
+            print("results: {}".format(results))
+            return {k: round(float(v), 5) for k, v in results.items()}  # return results as 5 decimal place floats
+
         stats = self.get_stats()
         self.speed = dict(zip(self.speed.keys(), (x.t / len(self.dataloader.dataset) * 1e3 for x in dt)))
         self.finalize_metrics()

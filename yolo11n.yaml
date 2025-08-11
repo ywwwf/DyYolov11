@@ -64,7 +64,9 @@ b_head:
 
 only_backbone: False
 
-dynamic: False
+dynamic: True
+fast_inference_mode: False
 
-router_ins: [4, 6, 10]
-router_channels: [128, 128, 256]
+# TODO 目前是写死了这个通道数，后续利用scales中的参数去动态调整通道数
+router_ins: [4, 6]
+router_channels: [128, 128]

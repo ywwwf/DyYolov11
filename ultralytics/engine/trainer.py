@@ -177,6 +177,9 @@ class BaseTrainer:
         # 辅助去冻结哪些参数
         self.only_backbone = self.args.only_backbone
 
+        # 置为路由器训练模式
+        self.dynamicTrain = self.args.dynamicTrain
+
         # Callbacks
         self.callbacks = _callbacks or callbacks.get_default_callbacks()
         if RANK in {-1, 0}:
@@ -231,7 +234,10 @@ class BaseTrainer:
                 ddp_cleanup(self, str(file))
 
         else:
-            self._do_train(world_size)
+            if not self.dynamicTrain:
+                self._do_train(world_size)
+            else:
+                self._do_train_dy(world_size)
 
     def _setup_scheduler(self):
         """Initialize training learning rate scheduler."""
@@ -351,6 +357,99 @@ class BaseTrainer:
             decay=weight_decay,
             iterations=iterations,
         )
+        # Scheduler
+        self._setup_scheduler()
+        self.stopper, self.stop = EarlyStopping(patience=self.args.patience), False
+        self.resume_training(ckpt)
+        self.scheduler.last_epoch = self.start_epoch - 1  # do not move
+        self.run_callbacks("on_pretrain_routine_end")
+
+    def _setup_train_dy(self, world_size):
+        """Build dataloaders and optimizer on correct rank process for Router."""
+        # Model
+        self.run_callbacks("on_pretrain_routine_start")
+        ckpt = self.setup_model()
+        self.model = self.model.to(self.device)
+        self.set_model_attributes()
+
+        # 冻结除了路由器以外的所有参数
+        for k, v in self.model.named_parameters():
+            if 'router' not in k:
+                print('freezing %s' % k)
+                v.requires_grad = False
+
+        # Check AMP
+        self.amp = torch.tensor(self.args.amp).to(self.device)  # True or False
+        if self.amp and RANK in {-1, 0}:  # Single-GPU and DDP
+            callbacks_backup = callbacks.default_callbacks.copy()  # backup callbacks as check_amp() resets them
+            self.amp = torch.tensor(check_amp(self.model), device=self.device)
+            callbacks.default_callbacks = callbacks_backup  # restore callbacks
+        if RANK > -1 and world_size > 1:  # DDP
+            dist.broadcast(self.amp.int(), src=0)  # broadcast from rank 0 to all other ranks; gloo errors with boolean
+        self.amp = bool(self.amp)  # as boolean
+        self.scaler = (
+            torch.amp.GradScaler("cuda", enabled=self.amp) if TORCH_2_4 else torch.cuda.amp.GradScaler(enabled=self.amp)
+        )
+        if world_size > 1:
+            self.model = nn.parallel.DistributedDataParallel(self.model, device_ids=[RANK], find_unused_parameters=True)
+
+        # Check imgsz
+        gs = max(int(self.model.stride.max() if hasattr(self.model, "stride") else 32), 32)  # grid size (max stride)
+        self.args.imgsz = check_imgsz(self.args.imgsz, stride=gs, floor=gs, max_dim=1)
+        self.stride = gs  # for multiscale training
+
+        # Batch size
+        if self.batch_size < 1 and RANK == -1:  # single-GPU only, estimate best batch size
+            self.args.batch = self.batch_size = self.auto_batch()
+
+        # Dataloaders
+        batch_size = self.batch_size // max(world_size, 1)
+        self.train_loader = self.get_dataloader(
+            self.data["train"], batch_size=batch_size, rank=LOCAL_RANK, mode="train"
+        )
+        if RANK in {-1, 0}:
+            # Note: When training DOTA dataset, double batch size could get OOM on images with >2000 objects.
+            self.test_loader = self.get_dataloader(
+                self.data.get("val") or self.data.get("test"),
+                batch_size=1,
+                rank=-1,
+                mode="val",
+            )
+            # TODO validator修改
+            self.validator = self.get_validator()
+            metric_keys = self.validator.metrics.keys + self.label_loss_items(prefix="val")
+            self.metrics = dict(zip(metric_keys, [0] * len(metric_keys)))
+            self.metrics_exit = dict(zip(metric_keys, [0] * len(metric_keys)))
+            self.ema = ModelEMA(self.model)
+            if self.args.plots:
+                self.plot_training_labels()
+
+        # Optimizer 超参直接在这里写死了
+        hyp = {'lr0': 0.00001, 'weight_decay': 0.005, 'momentum': 0.937}
+        nbs = 64  # nominal batch size
+        self.accumulate = max(round(nbs / self.batch_size), 1)  # accumulate loss before optimizing
+        hyp['weight_decay'] *= self.batch_size * self.accumulate / nbs  # scale weight_decay
+
+        pg0, pg1, pg2 = [], [], []  # optimizer parameter groups
+        for k, v in self.model.named_modules():
+            if 'router' in k:
+                if hasattr(v, 'bias') and isinstance(v.bias, nn.Parameter):
+                    pg2.append(v.bias)  # biases
+                if isinstance(v, nn.BatchNorm2d):
+                    pg0.append(v.weight)  # no decay
+                elif hasattr(v, 'weight') and isinstance(v.weight, nn.Parameter):
+                    pg1.append(v.weight)  # apply decay
+
+        self.optimizer = optim.AdamW(pg1, lr=hyp['lr0'], weight_decay=hyp['weight_decay'],
+                                    betas=(hyp['momentum'], 0.999))  # adjust beta1 to momentum
+
+        if len(pg0):
+            self.optimizer.add_param_group({'params': pg0, 'weight_decay': 0})  # add pg0 without weight_decay
+        if len(pg2):
+            self.optimizer.add_param_group({'params': pg2, 'weight_decay': 0})  # add pg2 (biases)
+        LOGGER.info('Optimizer groups: %g .bias, %g conv.weight, %g other' % (len(pg2), len(pg1), len(pg0)))
+        del pg0, pg1, pg2
+
         # Scheduler
         self._setup_scheduler()
         self.stopper, self.stop = EarlyStopping(patience=self.args.patience), False
@@ -510,11 +609,11 @@ class BaseTrainer:
                 # Validation
                 if self.args.val or final_epoch or self.stopper.possible_stop or self.stop:
                     self._clear_memory(threshold=0.5)  # prevent VRAM spike
-                    self.metrics, self.fitness = self.validate(True)
+                    self.metrics, self.fitness = self.validate(only_backbone=True)
                 # Branchy Validation 验证分支的结果
                 if self.args.val and not self.only_backbone:
                     self._clear_memory(threshold=0.5)
-                    self.metrics_exit, self.fitness_exit = self.validate(False)
+                    self.metrics_exit, self.fitness_exit = self.validate(only_backbone=False)
                     # 修改 self.metrics_exit 的键的名称 为所有键名添加"EX"前缀 方便之后记录
                     self.metrics_exit = {f"EX{key}": value for key, value in self.metrics_exit.items()}
                     # TODO 把self.metrics_exit拼接到self.metrics当中？
@@ -575,6 +674,167 @@ class BaseTrainer:
         unset_deterministic()
         self.run_callbacks("teardown")
 
+    def _do_train_dy(self, world_size=1):
+        """Train the Router."""
+        if world_size > 1:
+            self._setup_ddp(world_size)
+        self._setup_train_dy(world_size)
+
+        nb = len(self.train_loader)  # number of batches
+        nw = max(round(self.args.warmup_epochs * nb), 100) if self.args.warmup_epochs > 0 else -1  # warmup iterations
+        last_opt_step = -1
+        self.epoch_time = None
+        self.epoch_time_start = time.time()
+        self.train_time_start = time.time()
+        self.run_callbacks("on_train_start")
+        LOGGER.info(
+            f"Image sizes {self.args.imgsz} train, {self.args.imgsz} val\n"
+            f"Using {self.train_loader.num_workers * (world_size or 1)} dataloader workers\n"
+            f"Logging results to {colorstr('bold', self.save_dir)}\n"
+            f"Starting training for " + (f"{self.args.time} hours..." if self.args.time else f"{self.epochs} epochs...")
+        )
+        if self.args.close_mosaic:
+            base_idx = (self.epochs - self.args.close_mosaic) * nb
+            self.plot_idx.extend([base_idx, base_idx + 1, base_idx + 2])
+        epoch = self.start_epoch
+        self.optimizer.zero_grad()  # zero any resumed gradients to ensure stability on train start
+        # TODO 修改epoch退出条件
+        while True:
+            mloss = torch.zeros(4, device=self.device)  # mean losses
+            self.epoch = epoch
+            self.run_callbacks("on_train_epoch_start")
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")  # suppress 'Detected lr_scheduler.step() before optimizer.step()'
+                self.scheduler.step()
+
+            self._model_train()
+            if RANK != -1:
+                self.train_loader.sampler.set_epoch(epoch)
+            pbar = enumerate(self.train_loader)
+            # Update dataloader attributes (optional)
+            if epoch == (self.epochs - self.args.close_mosaic):
+                self._close_dataloader_mosaic()
+                self.train_loader.reset()
+
+            if RANK in {-1, 0}:
+                LOGGER.info(('\n' + '%10s' * 8) % ('Epoch', 'gpu_mem', 'diff', 'score.0', 'score.1', 'total', 'labels', 'img_size'))
+                pbar = TQDM(enumerate(self.train_loader), total=nb)
+            self.tloss = None
+            for i, batch in pbar:
+                self.run_callbacks("on_train_batch_start")
+                # Warmup
+                ni = i + nb * epoch
+                if ni <= nw:
+                    xi = [0, nw]  # x interp
+                    self.accumulate = max(1, int(np.interp(ni, xi, [1, self.args.nbs / self.batch_size]).round()))
+                    for j, x in enumerate(self.optimizer.param_groups):
+                        # Bias lr falls from 0.1 to lr0, all other lrs rise from 0.0 to lr0
+                        x["lr"] = np.interp(
+                            ni, xi, [self.args.warmup_bias_lr if j == 0 else 0.0, x["initial_lr"] * self.lf(epoch)]
+                        )
+                        if "momentum" in x:
+                            x["momentum"] = np.interp(ni, xi, [self.args.warmup_momentum, self.args.momentum])
+
+                # Forward
+                with autocast(self.amp):
+                    batch = self.preprocess_batch(batch)
+                    self.loss, self.loss_items = self.model(batch)
+                    if RANK != -1:
+                        self.loss *= world_size
+
+                # Backward
+                self.scaler.scale(self.loss).backward()
+
+                # Optimize
+                if ni % self.accumulate == 0:
+                    self.scaler.step(self.optimizer)  # optimizer.step
+                    self.scaler.update()
+                    self.optimizer.zero_grad()
+                    if self.ema:
+                        self.ema.update(self.model)
+
+                # Log
+                if RANK in {-1, 0}:
+                    mloss = (mloss * i + self.loss_items) / (i + 1)  # update mean losses
+                    mem = '%.3gG' % (torch.cuda.memory_reserved() / 1E9 if torch.cuda.is_available() else 0)  # (GB)
+                    s = ('%10s' * 2 + '%10.4g' * 6) % (
+                        '%g/%g' % (epoch, self.epochs - 1),
+                        mem,
+                        *mloss,
+                        batch["cls"].shape[0],
+                        batch["img"].shape[-1])
+                    pbar.set_description(s)
+                    self.run_callbacks("on_batch_end")
+                    # if self.args.plots and ni in self.plot_idx:
+                    #     self.plot_training_samples(batch, ni)
+
+                self.run_callbacks("on_train_batch_end")
+            # end of batch ---------------------------------------------------------------------------------------------
+
+            self.lr = {f"lr/pg{ir}": x["lr"] for ir, x in enumerate(self.optimizer.param_groups)}  # for loggers
+            self.run_callbacks("on_train_epoch_end")
+            if RANK in {-1, 0}:
+                final_epoch = epoch + 1 >= self.epochs
+                self.ema.update_attr(self.model, include=["yaml", "nc", "args", "names", "stride", "class_weights"])
+
+                # Validation
+                if self.args.val or final_epoch or self.stopper.possible_stop or self.stop:
+                    self._clear_memory(threshold=0.5)  # prevent VRAM spike
+                    self.metrics, self.fitness = self.validate(only_backbone=True, dynamic=True)
+                    # print("观察如何统计self.loss_items {}".format(val_loss_items))
+                # 仅凭借val_loss作为选取最优模型的标准 TODO 思考更好的标准
+                if not self.best_fitness or self.best_fitness < self.fitness:
+                    self.best_fitness = self.fitness
+
+                self.save_metrics(metrics={
+                    **self.label_loss_items_dy(mloss),
+                    **self.metrics,
+                    **self.lr})
+
+                self.stop |= self.stopper(epoch + 1, self.fitness) or final_epoch
+                if self.args.time:
+                    self.stop |= (time.time() - self.train_time_start) > (self.args.time * 3600)
+
+                # Save model
+                if self.args.save or final_epoch:
+                    self.save_model()
+                    self.run_callbacks("on_model_save")
+
+            # Scheduler
+            t = time.time()
+            self.epoch_time = t - self.epoch_time_start
+            self.epoch_time_start = t
+            if self.args.time:
+                mean_epoch_time = (t - self.train_time_start) / (epoch - self.start_epoch + 1)
+                self.epochs = self.args.epochs = math.ceil(self.args.time * 3600 / mean_epoch_time)
+                self._setup_scheduler()
+                self.scheduler.last_epoch = self.epoch  # do not move
+                self.stop |= epoch >= self.epochs  # stop if exceeded epochs
+            self.run_callbacks("on_fit_epoch_end")
+            self._clear_memory(0.5)  # clear if memory utilization > 50%
+
+            # Early Stopping
+            if RANK != -1:  # if DDP training
+                broadcast_list = [self.stop if RANK == 0 else None]
+                dist.broadcast_object_list(broadcast_list, 0)  # broadcast 'stop' to all ranks
+                self.stop = broadcast_list[0]
+            if self.stop:
+                break  # must break all DDP ranks
+            epoch += 1
+        # end of epoch -------------------------------------------------------------------------------------------------
+
+        if RANK in {-1, 0}:
+            # Do final val with best.pt
+            seconds = time.time() - self.train_time_start
+            LOGGER.info(f"\n{epoch - self.start_epoch + 1} epochs completed in {seconds / 3600:.3f} hours.")
+            # self.final_eval()
+            # if self.args.plots:
+            #     self.plot_metrics()
+            self.run_callbacks("on_train_end")
+        self._clear_memory()
+        unset_deterministic()
+        self.run_callbacks("teardown")
+
     def auto_batch(self, max_num_obj=0):
         """Calculate optimal batch size based on model and device memory constraints."""
         return check_train_batch_size(
@@ -622,9 +882,10 @@ class BaseTrainer:
         """Set model in training mode."""
         self.model.train()
         # Freeze BN stat
-        for n, m in self.model.named_modules():
-            if any(filter(lambda f: f in n, self.freeze_layer_names)) and isinstance(m, nn.BatchNorm2d):
-                m.eval()
+        if not self.dynamicTrain:
+            for n, m in self.model.named_modules():
+                if any(filter(lambda f: f in n, self.freeze_layer_names)) and isinstance(m, nn.BatchNorm2d):
+                    m.eval()
 
     def save_model(self):
         """Save model training checkpoints with additional metadata."""
@@ -722,19 +983,23 @@ class BaseTrainer:
         """Allow custom preprocessing model inputs and ground truths depending on task type."""
         return batch
 
-    def validate(self, only_backbone=True):
+    def validate(self, only_backbone=True, dynamic=False):
         """
         Run validation on test set using self.validator.
 
         Args:
+            dynamic (bool): 表示此时是在训练路由器
             only_backbone (bool): 作为区别验证模式的标志，验证main分支还是exit分支.
 
         Returns:
             metrics (dict): Dictionary of validation metrics.
             fitness (float): Fitness score for the validation.
         """
-        metrics = self.validator(self, only_backbone)
-        fitness = metrics.pop("fitness", -self.loss.detach().cpu().numpy())  # use loss as fitness measure if not found
+        metrics = self.validator(self, only_backbone=only_backbone, dynamic=dynamic)
+        if not dynamic:
+            fitness = metrics.pop("fitness", -self.loss.detach().cpu().numpy())  # use loss as fitness measure if not found
+        else:
+            fitness = metrics.pop("val/adaptive_loss")
         return metrics, fitness
 
     def get_model(self, cfg=None, weights=None, verbose=True):
@@ -761,6 +1026,21 @@ class BaseTrainer:
             This is not needed for classification but necessary for segmentation & detection
         """
         return {"loss": loss_items} if loss_items is not None else ["loss"]
+
+    def label_loss_items_dy(self, loss_items=None, prefix="train"):
+        """
+        Return a loss dict with labelled training loss items tensor.
+
+        Note:
+            This is not needed for classification but necessary for segmentation & detection
+        """
+        loss_names = ["loss_diff", "score", "1-score", "adaptive_loss"]
+        keys = [f"{prefix}/{x}" for x in loss_names]
+        if loss_items is not None:
+            loss_items = [round(float(x), 5) for x in loss_items]  # convert tensors to 5 decimal place floats
+            return dict(zip(keys, loss_items))
+        else:
+            return keys
 
     def set_model_attributes(self):
         """Set or update model parameters before training."""
