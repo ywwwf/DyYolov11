@@ -198,7 +198,8 @@ class v8DetectionLoss:
         """Initialize v8DetectionLoss with model parameters and task-aligned assignment settings."""
         device = next(model.parameters()).device  # get model device
         h = model.args  # hyperparameters
-        if only_backbone == 1:
+        # print("model.args: {}".format(model.args))
+        if only_backbone:
             m = model.model[23]  # Detect() module
         else:
             m = model.model[-1]

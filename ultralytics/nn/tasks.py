@@ -200,7 +200,7 @@ class BaseModel(torch.nn.Module):
                 res.append(x)
 
             return res
-        # Router训练
+        # Router训练 and inference
         else:
             # shared backbone
             for m in self.model:
@@ -221,11 +221,11 @@ class BaseModel(torch.nn.Module):
                     break
             # 根据shared backbone的两个特征图计算difficulty score 注意此处的score = 1 - difficulty score(paper)
             score = self.router([y[i] for i in self.router_ins])
+            # print("\n打印每次的分数：{}".format(score))
             if not hasattr(self, 'get_score'):
                 self.get_score = False
             if self.get_score:
                 return score
-
             # 训练模式的时候，需要返回两个出口的结果
             # TODO 暂时不再用self.training作为标志 专门去设置一个inference mode
             if not self.fast_inference_mode:
@@ -423,10 +423,75 @@ class BaseModel(torch.nn.Module):
             weights (dict | torch.nn.Module): The pre-trained weights to be loaded.
             verbose (bool, optional): Whether to log the transfer progress.
         """
-        model = weights["model"] if isinstance(weights, dict) else weights  # torchvision models are not dicts
+        model = None
+        router_weights = None
+        if isinstance(weights, dict):
+            # 提取model权重（必选）
+            if "model" in weights:
+                model = weights["model"]
+            else:
+                raise ValueError("weights dict must contain 'model' key")  # 确保model存在
+
+            # 提取router权重（可选，不存在则为None）
+            if "router" in weights:
+                router_weights = weights["router"]
+
+            # 处理非字典类型的weights（默认为model权重）
+        else:
+            model = weights  # 直接将整个weights视为model的权重
         csd = model.float().state_dict()  # checkpoint state_dict as FP32
+        if router_weights is not None:
+            csd_router = router_weights.float().state_dict()
+            self.router.load_state_dict(csd_router, strict=False)  # load
+            print("router_weights is loaded!")
+        # ==============================================================================================================
+        self_sd = self.state_dict()  # 当前模型 state_dict
+        # --------------------------
+        # 1. 打印基础信息
+        # --------------------------
+        print(f"预训练权重包含 {len(csd)} 个权重项")
+        print(f"当前模型包含 {len(self_sd)} 个权重项")
+
+        # --------------------------
+        # 2. 提取键名并对比
+        # --------------------------
+        csd_keys = set(csd.keys())
+        self_keys = set(self_sd.keys())
+
+        # 仅预训练有，当前模型没有的键
+        only_csd = csd_keys - self_keys
+        # 仅当前模型有，预训练没有的键
+        only_self = self_keys - csd_keys
+        # 双方都有的键（名称相同）
+        common_keys = csd_keys & self_keys
+
+        print(f"\n仅预训练存在的权重项：{len(only_csd)} 个")
+        if len(only_csd) > 0:
+            print(f"  示例：{list(only_csd)}...")  # 打印前5个示例
+
+        print(f"仅当前模型存在的权重项：{len(only_self)} 个")
+        if len(only_self) > 0:
+            print(f"  示例：{list(only_self)}...")
+
+        # --------------------------
+        # 3. 检查共同键的形状是否匹配
+        # --------------------------
+        shape_mismatch = []
+        for key in common_keys:
+            if csd[key].shape != self_sd[key].shape:
+                shape_mismatch.append({
+                    "key": key,
+                    "csd_shape": csd[key].shape,
+                    "self_shape": self_sd[key].shape
+                })
+
+        print(f"\n名称相同但形状不匹配的权重项：{len(shape_mismatch)} 个")
+        if len(shape_mismatch) > 0:
+            for item in shape_mismatch[:5]:  # 打印前5个示例
+                print(f"  键：{item['key']}，预训练形状：{item['csd_shape']}，当前模型形状：{item['self_shape']}")
+        # ==============================================================================================================
         updated_csd = intersect_dicts(csd, self.state_dict())  # intersect
-        self.load_state_dict(updated_csd, strict=False)  # load
+        self.model.load_state_dict(updated_csd, strict=False)  # load
         len_updated_csd = len(updated_csd)
         first_conv = "model.0.conv.weight"  # hard-coded to yolo models for now
         # mostly used to boost multi-channel training
@@ -439,7 +504,11 @@ class BaseModel(torch.nn.Module):
                 state_dict[first_conv][:c1, :c2] = csd[first_conv][:c1, :c2]
                 len_updated_csd += 1
         if verbose:
-            LOGGER.info(f"Transferred {len_updated_csd}/{len(self.model.state_dict())} items from pretrained weights")
+            if not self.dynamic:
+                LOGGER.info(f"Transferred {len_updated_csd}/{len(self.model.state_dict())} items from pretrained weights")
+            else:
+                LOGGER.info(
+                    f"Transferred {len_updated_csd}/{len(self.model.state_dict())+len(self.router.state_dict())} items from pretrained weights")
 
     def loss(self, batch, preds=None):
         """
@@ -463,25 +532,32 @@ class BaseModel(torch.nn.Module):
                 raw_losses.append(self.criterion2(preds[1], batch))
             return raw_losses
         else:
-            preds, score = self.forward(batch["img"])
-            _, loss_items2 = self.criterion1(preds[0], batch)  # 应当用简单网络的loss - 复杂网络的loss
-            _, self.loss_items = self.criterion2(preds[1], batch)
-            loss = self.loss_items.sum()
-            loss_2 = loss_items2.sum()
-            self.iter_count += 1
-            current_diff = loss - loss_2
-            self.diff_list.append(current_diff.item())
-            # (online) calculation of the loss difference
-            if self.iter_count < 10000:
-                self.tracked_diff = np.median(self.diff_list)
-            elif self.iter_count % 1000 == 0:
-                self.tracked_diff = np.median(self.diff_list)
-            loss = loss - self.tracked_diff / 2
-            loss_2 = loss_2 + self.tracked_diff / 2
-            adaptive_loss = score[:, 0] * loss + (1 - score[:, 0]) * loss_2
-            # 标量升维
-            current_diff_1d = current_diff.unsqueeze(0)
-            return adaptive_loss * batch_size, torch.cat((current_diff_1d, score[:, 0], 1 - score[:, 0], adaptive_loss)).detach()
+            if preds is None:
+                preds, score = self.forward(batch["img"])
+                _, loss_items2 = self.criterion1(preds[0], batch)  # 应当用简单网络的loss - 复杂网络的loss
+                _, self.loss_items = self.criterion2(preds[1], batch)
+                loss = self.loss_items.sum()
+                loss_2 = loss_items2.sum()
+                self.iter_count += 1
+                current_diff = loss - loss_2
+                self.diff_list.append(current_diff.item())
+                # (online) calculation of the loss difference
+                if self.iter_count < 10000:
+                    self.tracked_diff = np.median(self.diff_list)
+                elif self.iter_count % 1000 == 0:
+                    self.tracked_diff = np.median(self.diff_list)
+                loss = loss - self.tracked_diff / 2
+                loss_2 = loss_2 + self.tracked_diff / 2
+                adaptive_loss = score[:, 0] * loss + (1 - score[:, 0]) * loss_2
+                # 标量升维
+                current_diff_1d = current_diff.unsqueeze(0)
+                return (adaptive_loss * batch_size,
+                        torch.cat((current_diff_1d, score[:, 0], 1 - score[:, 0], adaptive_loss)).detach())
+            else:
+                raw_losses = [self.criterion2(preds[0], batch)]
+                if len(preds) == 2:
+                    raw_losses.append(self.criterion1(preds[1], batch))
+                return raw_losses
 
 
     def init_criterion(self, only_backbone=True):
@@ -560,7 +636,7 @@ class DetectionModel(BaseModel):
             reduction = self.yaml.get('router_reduction', 4)
             self.router = AdaptiveRouter(router_channels, 1, reduction=reduction)
             self.router_ins = self.yaml['router_ins']
-            self.dy_thres = 0.5
+            self.dy_thres = self.yaml['dy_thres']
             self.get_score = False
 
         # 用于控制loss补偿的更新频率
@@ -592,28 +668,30 @@ class DetectionModel(BaseModel):
         else:
             self.stride = torch.Tensor([32])  # default stride for i.e. RTDETR
         # 为第二个detect模块build stides
-        if not self.only_backbone:
-            m2 = self.model[-1]
-            if isinstance(m2, Detect):
-                s = 256  # 2x min stride
-                m2.inplace = self.inplace
+        # if self.only_backbone: TODO 都去初始化detect模块的步长试一下吧
+        m2 = self.model[-1]
+        if isinstance(m2, Detect):
+            s = 256  # 2x min stride
+            m2.inplace = self.inplace
 
-                def _forward(x):
-                    if self.end2end:
-                        return self.forward(x)["one2many"]
-                    return self.forward(x)[0] if isinstance(m2, (Segment, YOLOESegment, Pose, OBB)) else self.forward(x)
+            def _forward(x):
+                if self.end2end:
+                    return self.forward(x)["one2many"]
+                return self.forward(x)[0] if isinstance(m2, (Segment, YOLOESegment, Pose, OBB)) else self.forward(x)
 
-                self.model.eval()
-                m2.training = True
-                temp_dynamic = self.dynamic
-                self.dynamic = False  # 避免返回值多个score
-                m2.stride = torch.tensor([s / x.shape[-2] for x in _forward(torch.zeros(1, ch, s, s))[1]])
-                self.dynamic = temp_dynamic
-                self.stride = m2.stride
-                self.model.train()
-                m2.bias_init()
-            else:
-                self.stride = torch.Tensor([32])  # default stride for i.e. RTDETR
+            self.model.eval()
+            m2.training = True
+            temp_dynamic = self.dynamic
+            self.dynamic = False  # 避免返回值多个score
+            # self.only_backbone = False
+            m2.stride = torch.tensor([s / x.shape[-2] for x in _forward(torch.zeros(1, ch, s, s))[1]])
+            # self.only_backbone = True
+            self.dynamic = temp_dynamic
+            self.stride = m2.stride
+            self.model.train()
+            m2.bias_init()
+        else:
+            self.stride = torch.Tensor([32])  # default stride for i.e. RTDETR
 
         # Init weights, biases
         initialize_weights(self)

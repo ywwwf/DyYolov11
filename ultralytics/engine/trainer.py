@@ -619,12 +619,12 @@ class BaseTrainer:
                     # 修改 self.metrics_exit 的键的名称 为所有键名添加"EX"前缀 方便之后记录
                     self.metrics_exit = {f"EX{key}": value for key, value in self.metrics_exit.items()}
                     # TODO 把self.metrics_exit拼接到self.metrics当中？
-                # 给两个出口的综合得分标准赋予不同权重，倾向于选择分支效果更好的模型
-                # TODO 将超参提取出来 self.metrics保存模型呢块不改了
-                self.fitness = 0.3 * self.fitness + 0.7 * self.fitness_exit
-                # 由于需要计算两个fitness 所以best_fitness的标准也要发生变化
-                if not self.best_fitness or self.best_fitness < self.fitness:
-                    self.best_fitness = self.fitness
+                    # 给两个出口的综合得分标准赋予不同权重，倾向于选择分支效果更好的模型
+                    # TODO 将超参提取出来 self.metrics保存模型呢块不改了
+                    self.fitness = 0.3 * self.fitness + 0.7 * self.fitness_exit
+                    # 由于需要计算两个fitness 所以best_fitness的标准也要发生变化
+                    if not self.best_fitness or self.best_fitness < self.fitness:
+                        self.best_fitness = self.fitness
 
                 self.save_metrics(metrics={
                     **self.label_loss_items(self.tloss),
@@ -700,7 +700,6 @@ class BaseTrainer:
             self.plot_idx.extend([base_idx, base_idx + 1, base_idx + 2])
         epoch = self.start_epoch
         self.optimizer.zero_grad()  # zero any resumed gradients to ensure stability on train start
-        # TODO 修改epoch退出条件
         while True:
             mloss = torch.zeros(4, device=self.device)  # mean losses
             self.epoch = epoch
@@ -863,7 +862,6 @@ class BaseTrainer:
         gs = max(int(self.model.stride.max() if hasattr(self.model, "stride") else 32), 32)  # grid size (max stride)
         self.args.imgsz = check_imgsz(self.args.imgsz, stride=gs, floor=gs, max_dim=1)
         self.stride = gs  # for multiscale training
-        # TODO 什么情况下model不止是有模块？
         self.model.get_score = True
 
         # Half
@@ -876,7 +874,7 @@ class BaseTrainer:
         if device.type != 'cpu':
             self.model(torch.zeros(1, 3, imgsz, imgsz).to(device).type_as(next(self.model.parameters())))  # run once
 
-        print(self.val_loader)
+        # print(self.val_loader)
         score_list = []
         for batch_i, img_batch in enumerate(tqdm(self.val_loader)):
             img = img_batch["img"]
@@ -894,7 +892,93 @@ class BaseTrainer:
         for i in list(range(10, 100, 10)):
             thres.append(str(np.percentile(score_list, i)))
         thres.append('1')
+
         return thres
+
+    def _split_val_by_score(self, thres=0.512, batch_size=32, imgsz=640, augment=False, half_precision=True):
+        """将验证集划分为hard imgs和easy imgs."""
+        device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+        self.model.to(device)
+
+        # 加载数据集并获取验证集路径（用于追溯样本）
+        with torch_distributed_zero_first(LOCAL_RANK):
+            self.data = self.get_dataset()
+        val_data_paths = self.data["val"]  # 原始验证集路径（可能是文件列表或包含路径的txt文件）
+        self.val_loader = self.get_dataloader(val_data_paths, batch_size=batch_size, rank=LOCAL_RANK, mode="val")
+
+        # 模型准备（同原代码）
+        for p in self.model.parameters():
+            p.requires_grad = False
+        self.model.float().fuse().eval()
+        # ...（省略模型兼容性处理和半精度设置）...
+        self.model.get_score = True
+        self.model(torch.zeros(1, 3, imgsz, imgsz).to(device).type_as(next(self.model.parameters())))  # 预热
+
+        # 关键：记录每个样本的路径和对应的分数
+        sample_info = []  # 存储元组 (样本路径, 分数)
+        for batch_i, img_batch in enumerate(tqdm(self.val_loader)):
+            img = img_batch["img"].to(device, non_blocking=True).float() / 255.0
+            paths = img_batch["im_file"]  # 获取当前batch的样本路径（需确认DataLoader是否返回该字段，通常会有）
+
+            with torch.no_grad():
+                cur_scores = self.model(img, augment=augment)  # 假设返回形状为 [batch_size] 的分数张量
+
+            # 关联路径和分数（确保顺序对应）
+            for path, score in zip(paths, cur_scores):
+                sample_info.append((path, score.item()))
+
+        # 按阈值划分样本
+        high_score_samples = []  # 分数 >= thres 的样本路径
+        low_score_samples = []  # 分数 < thres 的样本路径
+        for path, score in sample_info:
+            if score >= thres:
+                high_score_samples.append(path)
+            else:
+                low_score_samples.append(path)
+
+        # 保存划分结果（可选：生成新的数据集配置文件或路径列表）
+        import json
+        with open("high_score_val.json", "w") as f:
+            json.dump(high_score_samples, f)
+        with open("low_score_val.json", "w") as f:
+            json.dump(low_score_samples, f)
+
+    def _test_val_by_difficulty(self, data_path, batch_size=1, imgsz=640):
+        # 统一一下用法，实际上没什么用的参数
+        self.amp = False
+
+        device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+        self.model.to(device)
+        self.ema = ModelEMA(self.model)
+
+        # Dataloader
+        self.test_loader = self.get_dataloader(
+            data_path, batch_size=batch_size, rank=LOCAL_RANK, mode="val"
+        )
+        for p in self.model.parameters():
+            p.requires_grad = False
+        self.model.float().fuse().eval()
+
+        # Compatibility updates
+        for m in self.model.modules():
+            if type(m) in [nn.Hardswish, nn.LeakyReLU, nn.ReLU, nn.ReLU6, nn.SiLU]:
+                m.inplace = True  # pytorch 1.7.0 compatibility
+            elif type(m) is nn.Upsample:
+                m.recompute_scale_factor = None  # torch 1.11.0 compatibility
+
+        # Check imgsz
+        gs = max(int(self.model.stride.max() if hasattr(self.model, "stride") else 32), 32)  # grid size (max stride)
+        self.args.imgsz = check_imgsz(self.args.imgsz, stride=gs, floor=gs, max_dim=1)
+
+        self.model.float()
+        # if device.type != 'cpu':
+        #     self.model(torch.zeros(1, 3, imgsz, imgsz).to(device).type_as(next(self.model.parameters())))  # run once
+
+        self.validator = self.get_validator()
+        self.metrics, _ = self.validate(only_backbone=False, dynamic=True, fast_inference_mode=True)
+
+        self.save_metrics(metrics={**self.metrics})
+
 
     def auto_batch(self, max_num_obj=0):
         """Calculate optimal batch size based on model and device memory constraints."""
@@ -1044,11 +1128,12 @@ class BaseTrainer:
         """Allow custom preprocessing model inputs and ground truths depending on task type."""
         return batch
 
-    def validate(self, only_backbone=True, dynamic=False):
+    def validate(self, only_backbone=True, dynamic=False, fast_inference_mode=False):
         """
         Run validation on test set using self.validator.
 
         Args:
+            fast_inference_mode: 推理模式
             dynamic (bool): 表示此时是在训练路由器
             only_backbone (bool): 作为区别验证模式的标志，验证main分支还是exit分支.
 
@@ -1056,7 +1141,8 @@ class BaseTrainer:
             metrics (dict): Dictionary of validation metrics.
             fitness (float): Fitness score for the validation.
         """
-        metrics = self.validator(self, only_backbone=only_backbone, dynamic=dynamic)
+        metrics = self.validator(self, only_backbone=only_backbone, dynamic=dynamic,
+                                 fast_inference_mode=fast_inference_mode)
         if not dynamic:
             fitness = metrics.pop("fitness",
                                   -self.loss.detach().cpu().numpy())  # use loss as fitness measure if not found

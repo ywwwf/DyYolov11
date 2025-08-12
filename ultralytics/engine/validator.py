@@ -127,7 +127,7 @@ class BaseValidator:
         self.callbacks = _callbacks or callbacks.get_default_callbacks()
 
     @smart_inference_mode()
-    def __call__(self, trainer=None, model=None, only_backbone=True, dynamic=False):
+    def __call__(self, trainer=None, model=None, only_backbone=True, dynamic=False, fast_inference_mode=False):
         """
         Execute validation process, running inference on dataloader and computing performance metrics.
 
@@ -148,8 +148,11 @@ class BaseValidator:
             self.args.half = self.device.type != "cpu" and trainer.amp
             model = trainer.ema.ema or trainer.model
             model = model.half() if self.args.half else model.float()
-            self.loss = torch.zeros_like(trainer.loss_items, device=trainer.device)
-            self.args.plots &= trainer.stopper.possible_stop or (trainer.epoch == trainer.epochs - 1)
+            if not fast_inference_mode:
+                self.loss = torch.zeros_like(trainer.loss_items, device=trainer.device)
+                self.args.plots &= trainer.stopper.possible_stop or (trainer.epoch == trainer.epochs - 1)
+            else:
+                self.loss = None
             model.eval()
         else:
             if str(self.args.model).endswith(".yaml") and model is None:
@@ -208,6 +211,8 @@ class BaseValidator:
             with dt[1]:
                 if not dynamic:
                     preds = model(batch["img"], augment=augment)
+                if fast_inference_mode:
+                    preds = model(batch["img"], augment=augment)
 
             # Loss
             with dt[2]:
@@ -219,7 +224,13 @@ class BaseValidator:
                             self.loss += model.loss(batch, preds)[1][1]
                     else:
                         # 直接交由loss作为fitness
-                        self.loss += model(batch)[1]
+                        if not fast_inference_mode:
+                            self.loss += model(batch)[1]
+                        else:
+                            if self.loss is not None:
+                                self.loss += model.loss(batch, preds)[0][1]
+                            else:
+                                self.loss = model.loss(batch, preds)[0][1]
 
             # Postprocess
             with dt[3]:
@@ -228,16 +239,18 @@ class BaseValidator:
                         preds = self.postprocess(preds[0])
                     else:
                         preds = self.postprocess(preds[1])
+                if fast_inference_mode:
+                    preds = self.postprocess(preds[0])
 
-            if not dynamic:
+            if fast_inference_mode or not dynamic:
                 self.update_metrics(preds, batch)
-                if self.args.plots and batch_i < 3:
-                    self.plot_val_samples(batch, batch_i)
-                    self.plot_predictions(batch, preds, batch_i)
+                # if self.args.plots and batch_i < 3:
+                #     self.plot_val_samples(batch, batch_i)
+                #     self.plot_predictions(batch, preds, batch_i)
 
                 self.run_callbacks("on_val_batch_end")
 
-        if self.training and dynamic:
+        if not fast_inference_mode and self.training and dynamic:
             model.float()
             # TODO 继承的方法为什么都对应不上？
             results = {**trainer.label_loss_items_dy(self.loss.cpu() / len(self.dataloader), prefix="val")}

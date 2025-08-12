@@ -809,6 +809,16 @@ class Model(torch.nn.Module):
         return self.metrics
 
     def get_thres(self, pretrained, trainer=None, **kwargs: Any):
+        """
+        两部分功能：1.获取阈值 2.依据阈值划分数据集 3.依据划分的数据集分别test
+        Args:
+            pretrained:
+            trainer:
+            **kwargs:
+
+        Returns:
+
+        """
         self.load(pretrained)
         print("加载了预训练模型，来源于：{}".format(pretrained))
 
@@ -826,13 +836,40 @@ class Model(torch.nn.Module):
             self.trainer.model = self.trainer.get_model(weights=self.model if self.ckpt else None, cfg=self.model.yaml)
             self.model = self.trainer.model
 
-        thres = self.trainer._get_thres()
-        print()
-        print('***************************************************')
-        print(' '.join(thres))
-        for idx, thr in enumerate(thres):
-            print('First: {}%\tSecond: {}%\tThreshold: {}'.format(100 - idx * 10, idx * 10, thr))
-        print('***************************************************')
+            # 功能1
+        # thres = self.trainer._get_thres()
+        # print()
+        # print('***************************************************')
+        # print(' '.join(thres))
+        # for idx, thr in enumerate(thres):
+        #     print('First: {}%\tSecond: {}%\tThreshold: {}'.format(100 - idx * 10, idx * 10, thr))
+        # print('***************************************************')
+
+        # 功能2
+        # self.trainer._split_val_by_score()
+
+        # 功能3
+        # self.trainer._test_val_by_difficulty(
+        #     data_path=r"E:\datasets\88675-main\88675-main\data\data\datasets_vehicle_copy\images\high_val")
+
+    def split_hard_easy_imgs(self, pretrained, trainer=None, **kwargs: Any):
+        self.load(pretrained)
+        print("加载了预训练模型，来源于：{}".format(pretrained))
+
+        overrides = YAML.load(checks.check_yaml(kwargs["cfg"])) if kwargs.get("cfg") else self.overrides
+        custom = {
+            # NOTE: handle the case when 'cfg' includes 'data'.
+            "data": overrides.get("data") or DEFAULT_CFG_DICT["data"] or TASK2DATA[self.task],
+            "model": self.overrides["model"],
+            "task": self.task,
+        }  # method defaults
+        args = {**overrides, **custom, **kwargs, "mode": "train"}  # highest priority args on the right
+
+        self.trainer = (trainer or self._smart_load("trainer"))(overrides=args, _callbacks=self.callbacks)
+        if not args.get("resume"):  # manually set model only if not resuming
+            self.trainer.model = self.trainer.get_model(weights=self.model if self.ckpt else None, cfg=self.model.yaml)
+            self.model = self.trainer.model
+        thres = self.trainer._split_hard_easy_imgs()
 
     def tune(
         self,
